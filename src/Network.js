@@ -1,19 +1,17 @@
 require('@tensorflow/tfjs-node')
-
-const read = require('./Read');
 const fs = require('fs');
 const tf = require('@tensorflow/tfjs');
-
-fs.writeFileSync('testing.txt', '');
-
-const testSize = 1000;
+const TESTING_ROOT = __dirname + '\\result\\testing.txt';
+const FAIL_CASE_ROOT = __dirname + '\\result\\failedCases.txt'
 
 class Network {
   constructor(sizes) {
-    let input = read();
+    fs.writeFileSync(TESTING_ROOT, '');
+    fs.writeFileSync(FAIL_CASE_ROOT, '');
     this.num_layers = sizes.length;
     //randomized value of bias and weight between 0 - 1;
     this.sizes = sizes;
+    this.epoches = 0;
     this.biases = sizes.reduce((root, value, index) => {
       if (index !== 0) {
         root.push(tf.randomNormal([value, 1], 0, 1, "int32"));
@@ -28,21 +26,34 @@ class Network {
     }, [])
   }
 
+  //although data is passbyreference, good practice to still return
+  dataRandomizer(data) {
+    return data.map(a => [Math.random(), a])
+      .sort((a, b) => a[0] - b[0])
+      .map(a => a[1]);
+  }
 
 
   //used to output the result after learning
-  feedForWard(input) {
-    input = tf.tensor(input).expandDims(1);
-    let output = this.biases.reduce((root, bias_layer, layer_index) => {
-      return this.sigmoid(tf.matMul(this.weights[layer_index], root).add(bias_layer));
-    }, input)
-    return output;
+  feedForWard(enter) {
+    return tf.tidy(() => {
+      let input = tf.tensor(enter).expandDims(1);
+      let output = this.biases.reduce((root, bias_layer, layer_index) => {
+        return this.sigmoid(tf.matMul(this.weights[layer_index], root).add(bias_layer));
+      }, input)
+      return output;
+    })
   }
 
   async evaluate(data) {
+    console.log('evaluating accuracy...');
+    data = this.dataRandomizer(data);
+    let n = data.length;
     let evaluate = 0;
-    for (let i = n - testSize; i < n; i++) {
-      let a = await this.feedForWard(data[i].input).array();
+    let errorCount = 0;
+    for (let i = 0; i < n; i++) {
+      let result = this.feedForWard(data[i].input);
+      let a = await result.array();
       let biggestIndex = 0;
       a.map((val, index, array) => {
         if (val[0] > array[biggestIndex][0])
@@ -50,26 +61,31 @@ class Network {
       })
       if (data[i].output[biggestIndex])
         evaluate++;
+      //print the first 10 failed example
+      else if (errorCount < 10) {
+        errorCount++;
+        fs.appendFileSync(FAIL_CASE_ROOT, `[${data[i].output}] -> [${data[i].input}]` + '\n')
+        fs.appendFileSync(FAIL_CASE_ROOT, `the AI recognized it as ${biggestIndex} \n`)
+      }
+      tf.dispose(result);
     }
-    console.log('finished, ' + `the correct rate is ${evaluate} / ${testSize} in epochs ${i} \n`)
+    console.log('evaluation complete')
+    fs.appendFileSync(TESTING_ROOT, `the correct rate is ${evaluate} / ${n} in epoches ${this.epoches}\n`);
+
   }
-  // eta = learning speed
+  //eta = learning speed
   //epoches is not used since we are not planning on using yet  
-  //training data format: 
+  //training data/test data format: 
   /** {
    * input: [array of input]
    *    * output: [expected output for array(1 for desire digit and 0 for all others)]
    * } */
-  async stochasticGradientDescent(training_data, epochs, mini_batch_size, eta, test_data = null) {
-
-    let n_test = test_data && test_data.length;
+  async stochasticGradientDescent(training_data, epoches, mini_batch_size, eta, test_data = null) {
     let n = training_data.length;
-    for (let i = 0; i < epochs; i++) {
-      console.log('Right now in epochs ' + i)
+    for (let i = 0; i < epoches; i++) {
+      console.log('Right now in epoches ' + this.epoches)
       //raindomize the data
-      let data = training_data.map(a => [Math.random(), a])
-        .sort((a, b) => a[0] - b[0])
-        .map(a => a[1]);
+      let data = this.dataRandomizer(training_data)
       //split the batches into bunch of mini batches
 
 
@@ -82,27 +98,20 @@ class Network {
       //////////actual code//////////////////////////////////////////////////
 
       let mini_batches = [];
-      for (let i = 0; i < (n - testSize); i += mini_batch_size)
+      for (let i = 0; i < n; i += mini_batch_size)
         mini_batches.push(data.slice(i, mini_batch_size + i));
       //updating the algorithm by letting it learn
       console.log('amount of mini_batches is ' + mini_batches.length)
       for (let i = 0; i < mini_batches.length; i++) {
-        this.updateMiniBatch(mini_batches[i], eta)
-      }
-      let evaluate = 0;
-      for (let i = n - testSize; i < n; i++) {
-        let a = await this.feedForWard(data[i].input).array();
-        let biggestIndex = 0;
-        a.map((val, index, array) => {
-          if (val[0] > array[biggestIndex][0])
-            biggestIndex = index;
+        tf.tidy(() => {
+          this.updateMiniBatch(mini_batches[i], eta)
         })
-        if (data[i].output[biggestIndex])
-          evaluate++;
+        console.log(i, 'numTensors: ' + tf.memory().numTensors);
       }
-      console.log('finished, ' + `the correct rate is ${evaluate} / ${testSize} in epochs ${i} \n`)
-      fs.appendFileSync('testing.txt', `the correct rate is ${evaluate} / ${testSize} in epochs ${i} \n`);
-      ////////////////////////////////
+      if (test_data)
+        await this.evaluate(test_data)
+      this.epoches++;
+      //////////////////////////////
     }
   }
 
@@ -125,13 +134,16 @@ class Network {
       })
     }
     //update 
-    this.weights = this.weights.map((value, index) => {
-      return value.sub(nabla_weights[index].mul(eta / mini_batch.length))
+    let newWeights = this.weights.map((value, index) => {
+      return tf.keep(value.sub(nabla_weights[index].mul(eta / mini_batch.length)))
     })
-    this.biases = this.biases.map((layer, index) => {
-      return layer.sub(nabla_biases[index].mul(eta / mini_batch.length))
+    tf.dispose(this.weights);
+    this.weights = newWeights;
+    let newBiases = this.biases.map((layer, index) => {
+      return tf.keep(layer.sub(nabla_biases[index].mul(eta / mini_batch.length)))
     })
-
+    tf.dispose(this.biases);
+    this.biases = newBiases
   }
 
 
@@ -140,8 +152,9 @@ class Network {
     output = tf.tensor(output).expandDims(1);
     let nabla_b = this.zeroOut(this.biases);
     let nabla_w = this.zeroOut(this.weights);
-    //feed forward
+    //feed forward once with current network, see the result
     let activation = tf.tensor(input).expandDims(1);
+    //normalizing input
     let activations = [activation.div(255)];
     let zs = [] // all the z which is = wa + b
     for (let i = 0; i < this.biases.length; i++) {
@@ -151,9 +164,10 @@ class Network {
       activations.push(activation);
     }
     //backward
-    // output layer
+    //check what is the cost_derivative base on the result and expected value
     let delta = this.cost_derivative(activations[activations.length - 1], output)
     delta = delta.mul(this.sigmoid_prime(zs[zs.length - 1]))
+    //backpropagation
     nabla_b[nabla_b.length - 1] = delta;
     nabla_w[nabla_w.length - 1] = tf.matMul(delta, activations[activations.length - 2].transpose())
     //  For each l=L−1,L−2,…,2 compute δx,l=((wl+1)Tδx,l+1)⊙σ′(zx,l).
@@ -162,17 +176,19 @@ class Network {
       let sp = this.sigmoid_prime(z);
       //calculate the error
       delta = tf.matMul(this.weights[this.weights.length - i + 1].transpose(), delta).mul(sp);
-      //update the gredient;
+      //update the gredient, not the actual weight and bias
       nabla_b[nabla_b.length - i] = delta;
       nabla_w[nabla_w.length - i] = tf.matMul(delta, activations[activations.length - i - 1].transpose());
     }
     return { delta_nabla_b: nabla_b, delta_nabla_w: nabla_w };
   }
+
+  //helper functions
+
   cost_derivative(output_activation, expected_output) {
     return output_activation.sub(expected_output);
   }
 
-  //helper functions
   zeroOut(array) {
     return array.map(value => {
       return tf.zeros(value.shape);
@@ -186,16 +202,6 @@ class Network {
   sigmoid_prime(x) {
     return tf.sigmoid(x).mul(tf.sigmoid(x).mul(-1).add(1));
   }
-
-
-
-
 }
 
-
 module.exports = Network;
-
-
-let test = new Network([784, 30, 10])
-// console.log(test.biases)
-// console.log(test.weights)
